@@ -1,0 +1,28 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+
+# Environment variables and secrets
+.env
+
+# Downloaded files
+downloads/*
+!downloads/.gitkeep
+
+# Generated experiment results
+results/*
+!results/.gitkeep
+
+# Temporary files
+*.tmp
+*.log
+
+# IDE settings
+.vscode/
+
+# Test cache
+.pytest_cache/
