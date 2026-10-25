@@ -1,0 +1,2 @@
+Hello World! This is my first P2P file distribution project.
+We are learning how file pieces and hash verification work.

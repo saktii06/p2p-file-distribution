@@ -1,0 +1,9 @@
+{
+    "filename": "sample.txt",
+    "file_size": 121,
+    "piece_size": 262144,
+    "number_of_pieces": 1,
+    "piece_hashes": [
+        "2a1996568b2789e0e0c803f21d9751cc08b53df37c60820fb4653f670ee2fa21"
+    ]
+}
