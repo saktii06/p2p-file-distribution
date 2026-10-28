@@ -16,6 +16,7 @@ from peer.tracker_client import TrackerClient
 
 
 class PeerServer:
+
     def __init__(
         self,
         peer_id,
@@ -23,7 +24,8 @@ class PeerServer:
         file_path,
         host="127.0.0.1",
         port=0,
-        use_tracker=False
+        use_tracker=False,
+        initial_pieces=None
     ):
         self.peer_id = peer_id
         self.file_id = file_id
@@ -31,11 +33,32 @@ class PeerServer:
         self.host = host
         self.port = port
 
-        # Load the file pieces and their SHA-256 hashes.
+        # Load file pieces and calculate their hashes.
         self.pieces, self.piece_hashes = split_file(file_path)
 
-        # Initially, this peer possesses the complete file.
-        self.available_pieces = set(range(len(self.pieces)))
+        # If initial_pieces is not provided, this peer
+        # starts with the complete file.
+        if initial_pieces is None:
+            self.available_pieces = set(range(len(self.pieces)))
+
+        else:
+            # Store only the pieces this peer initially owns.
+            self.available_pieces = set(initial_pieces)
+
+            # Validate the supplied piece indexes.
+            for index in self.available_pieces:
+                if not isinstance(index, int) or isinstance(index, bool):
+                    raise ValueError("Piece indexes must be integers.")
+
+                if index < 0 or index >= len(self.pieces):
+                    raise ValueError(
+                        f"Invalid piece index: {index}"
+                    )
+
+            # Remove data for pieces this peer does not own.
+            for index in range(len(self.pieces)):
+                if index not in self.available_pieces:
+                    self.pieces[index] = None
 
         # Protect piece storage when multiple threads access it.
         self.pieces_lock = threading.Lock()
@@ -82,7 +105,7 @@ class PeerServer:
                 f"on {self.host}:{self.port}"
             )
 
-            # Register the peer with the tracker.
+            # Register the peer and its available pieces.
             if self.use_tracker:
                 self.tracker_client.register_peer(
                     peer_id=self.peer_id,
@@ -117,17 +140,26 @@ class PeerServer:
         """Verify and store a newly downloaded piece."""
 
         # Check whether the piece index is valid.
-        if piece_index < 0 or piece_index >= len(self.pieces):
+        if (
+            not isinstance(piece_index, int)
+            or isinstance(piece_index, bool)
+            or piece_index < 0
+            or piece_index >= len(self.pieces)
+        ):
             raise ValueError("Invalid piece index.")
 
         # Verify the piece before storing it.
-        if not verify_piece(piece_data,self.piece_hashes[piece_index]):
+        if not verify_piece(
+            piece_data,
+            self.piece_hashes[piece_index]
+        ):
             raise ValueError("Piece verification failed.")
 
         # Store the piece and update availability safely.
         with self.pieces_lock:
             self.pieces[piece_index] = piece_data
             self.available_pieces.add(piece_index)
+
             available_pieces = sorted(self.available_pieces)
 
         print(
@@ -146,9 +178,16 @@ class PeerServer:
                     file_id=self.file_id,
                     pieces=available_pieces
                 )
-            except (OSError, ConnectionError, RuntimeError, ValueError) as error:
+
+            except (
+                OSError,
+                ConnectionError,
+                RuntimeError,
+                ValueError
+            ) as error:
                 print(
-                    f"[{self.peer_id}] Could not update tracker: {error}"
+                    f"[{self.peer_id}] Could not update tracker: "
+                    f"{error}"
                 )
 
         return True
@@ -167,7 +206,7 @@ class PeerServer:
                 send_message(connection, message)
 
             except (OSError, ConnectionError):
-                # A connection may have closed while notifying peers.
+                # A connection may have closed during notification.
                 pass
 
     def accept_connections(self):
@@ -235,7 +274,7 @@ class PeerServer:
                 create_handshake(self.peer_id, self.file_id)
             )
 
-            # Send the list of pieces currently available.
+            # Send the pieces currently available.
             with self.pieces_lock:
                 available_pieces = sorted(self.available_pieces)
 
@@ -254,7 +293,9 @@ class PeerServer:
 
                     # Validate the requested piece index.
                     if (
-                        piece_index < 0
+                        not isinstance(piece_index, int)
+                        or isinstance(piece_index, bool)
+                        or piece_index < 0
                         or piece_index >= len(self.pieces)
                     ):
                         print(
@@ -381,6 +422,7 @@ class PeerServer:
 
 
 if __name__ == "__main__":
+
     file_path = input(
         "Enter the path of the file to share: "
     ).strip()

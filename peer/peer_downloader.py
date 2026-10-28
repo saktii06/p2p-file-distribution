@@ -36,7 +36,6 @@ class PeerDownloader:
         self.output_path = output_path
         self.strategy = strategy
 
-        # Tracker connection.
         self.tracker_client = TrackerClient(
             tracker_host=tracker_host,
             tracker_port=tracker_port
@@ -46,22 +45,19 @@ class PeerDownloader:
         self.host = host
         self.port = port
 
-        # Load information about the original file.
         with open(metainfo_path, "r", encoding="utf-8") as file:
             self.metainfo = json.load(file)
 
         self.total_pieces = self.metainfo["number_of_pieces"]
         self.piece_hashes = self.metainfo["piece_hashes"]
 
-        # Store downloaded pieces using their indexes.
         self.downloaded_pieces = {}
 
-        # Download statistics.
         self.pieces_requested = 0
         self.pieces_downloaded = 0
 
-    def get_seeder_from_tracker(self):
-        """Discover a suitable seeder through the tracker."""
+    def get_peers_from_tracker(self):
+        """Find peers sharing this file through the tracker."""
 
         print("\nSearching for peers through the tracker...")
 
@@ -71,28 +67,110 @@ class PeerDownloader:
         )
 
         if not peers:
-            raise ValueError(
-                "No other peers found for this file."
-            )
+            raise ValueError("No other peers found for this file.")
 
         print(f"Tracker returned {len(peers)} peer(s).")
 
-        # Prefer a peer that possesses the complete file.
+        return peers
+
+    def get_seeder_from_tracker(self):
+        """Find one peer that has the complete file."""
+
+        peers = self.get_peers_from_tracker()
+
         for peer in peers:
-            if len(peer.get("pieces", [])) == self.total_pieces:
+            available = set(peer.get("pieces", []))
+
+            if len(available) == self.total_pieces:
                 print(
                     f"Selected seeder: {peer['peer_id']} "
                     f"at {peer['host']}:{peer['port']}"
                 )
                 return peer
 
-        raise ValueError(
-            "No complete seeder found. "
-            "Multi-peer downloading is not implemented yet."
+        raise ValueError("No complete seeder found.")
+
+    def connect_to_peer(self, peer):
+        """Connect to a peer and check which pieces it has."""
+
+        connection = socket.create_connection(
+            (peer["host"], peer["port"]),
+            timeout=10
         )
 
+        connection.settimeout(30)
+
+        try:
+            # Introduce ourselves to the peer.
+            send_message(
+                connection,
+                create_handshake(self.peer_id, self.file_id)
+            )
+
+            handshake = receive_message(connection)
+
+            if handshake["type"] != "HANDSHAKE":
+                raise ValueError("Invalid handshake received.")
+
+            if handshake["file_id"] != self.file_id:
+                raise ValueError("Peer has a different file ID.")
+
+            # Find out which pieces the peer actually possesses.
+            bitfield = receive_message(connection)
+
+            if bitfield["type"] != "BITFIELD":
+                raise ValueError("Expected a bitfield from peer.")
+
+            available_pieces = set(bitfield["pieces"])
+
+            # The peer may be registered with stale piece information.
+            # The bitfield received from the peer is the current source
+            # of truth for this connection.
+            print(
+                f"Connected to {handshake['peer_id']}; "
+                f"it has {len(available_pieces)} piece(s)."
+            )
+
+            return connection, available_pieces
+
+        except Exception:
+            connection.close()
+            raise
+
+    def download_piece(self, connection, piece_index):
+        """Request one piece and verify its contents."""
+
+        self.pieces_requested += 1
+
+        send_message(
+            connection,
+            create_request(piece_index)
+        )
+
+        response = receive_message(connection)
+
+        if response["type"] != "PIECE":
+            raise ValueError("Expected a PIECE response from peer.")
+
+        if response["piece_index"] != piece_index:
+            raise ValueError("Received a different piece than requested.")
+
+        piece_data = decode_piece(response)
+
+        expected_hash = self.piece_hashes[piece_index]
+
+        if not verify_piece(piece_data, expected_hash):
+            raise ValueError(
+                f"Hash verification failed for piece {piece_index}."
+            )
+
+        self.downloaded_pieces[piece_index] = piece_data
+        self.pieces_downloaded += 1
+
+        print(f"Piece {piece_index} received and verified.")
+
     def download(self):
-        """Discover a seeder and download the file."""
+        """Download a file using one or more peers."""
 
         print("=" * 45)
         print("P2P PEER DOWNLOADER")
@@ -101,129 +179,116 @@ class PeerDownloader:
         print(f"File: {self.metainfo['filename']}")
         print(f"Selection strategy: {self.strategy}")
 
+        connections = []
+
         try:
-            # Find a seeder through the tracker if no address was supplied.
-            if self.host is None or self.port is None:
-                seeder = self.get_seeder_from_tracker()
-                self.host = seeder["host"]
-                self.port = seeder["port"]
+            # Prepare the list of peers to use.
+            if self.host is not None and self.port is not None:
+                peers = [{
+                    "peer_id": "direct_peer",
+                    "host": self.host,
+                    "port": self.port
+                }]
+            else:
+                peers = self.get_peers_from_tracker()
 
-            print(
-                f"\nConnecting to seeder at "
-                f"{self.host}:{self.port}..."
-            )
+            # Connect to the peers and collect their available pieces.
+            peer_connections = []
+            piece_availability = {
+                index: [] for index in range(self.total_pieces)
+            }
 
-            with socket.create_connection(
-                (self.host, self.port),
-                timeout=10
-            ) as connection:
-
-                connection.settimeout(30)
-
-                # Introduce ourselves to the seeder.
-                send_message(
-                    connection,
-                    create_handshake(self.peer_id, self.file_id)
-                )
-
-                # Receive the seeder's handshake.
-                handshake = receive_message(connection)
-
-                if handshake["type"] != "HANDSHAKE":
-                    raise ValueError("Invalid handshake received.")
-
-                if handshake["file_id"] != self.file_id:
-                    raise ValueError("Seeder has a different file ID.")
-
-                print(
-                    f"Handshake successful with "
-                    f"{handshake['peer_id']}."
-                )
-
-                # Receive the seeder's bitfield.
-                bitfield = receive_message(connection)
-
-                if bitfield["type"] != "BITFIELD":
-                    raise ValueError("Expected a bitfield from seeder.")
-
-                available_pieces = set(bitfield["pieces"])
-
-                print(
-                    f"Seeder has {len(available_pieces)} "
-                    f"available pieces."
-                )
-
-                # Check that the seeder has the complete file.
-                required_pieces = set(range(self.total_pieces))
-
-                if not required_pieces.issubset(available_pieces):
-                    raise ValueError(
-                        "Seeder does not possess all required pieces."
+            for peer in peers:
+                try:
+                    connection, available_pieces = self.connect_to_peer(
+                        peer
                     )
 
-                # Create a manager to select pieces.
-                piece_manager = PieceManager(self.total_pieces)
+                    connections.append(connection)
 
-                # At this stage, only one seeder is used.
-                availability = {
-                    index: 1 for index in available_pieces
-                }
+                    peer_connections.append({
+                        "peer": peer,
+                        "connection": connection,
+                        "pieces": available_pieces
+                    })
 
-                print("\nStarting download...\n")
+                    for piece_index in available_pieces:
+                        if 0 <= piece_index < self.total_pieces:
+                            piece_availability[piece_index].append(
+                                peer["peer_id"]
+                            )
 
-                while not piece_manager.is_complete():
-
-                    piece_index = piece_manager.select_piece(
-                        self.strategy,
-                        availability
-                    )
-
-                    self.pieces_requested += 1
-
-                    print(f"Requesting piece {piece_index}...")
-
-                    # Request the selected piece.
-                    send_message(
-                        connection,
-                        create_request(piece_index)
-                    )
-
-                    response = receive_message(connection)
-
-                    if response["type"] != "PIECE":
-                        raise ValueError(
-                            "Expected a PIECE response from seeder."
-                        )
-
-                    if response["piece_index"] != piece_index:
-                        raise ValueError(
-                            "Received a different piece than requested."
-                        )
-
-                    piece_data = decode_piece(response)
-
-                    # Verify the piece using its SHA-256 hash.
-                    expected_hash = self.piece_hashes[piece_index]
-
-                    if not verify_piece(piece_data, expected_hash):
-                        raise ValueError(
-                            f"Hash verification failed for piece "
-                            f"{piece_index}."
-                        )
-
+                except (OSError, ValueError, RuntimeError) as error:
                     print(
-                        f"Piece {piece_index} received and verified."
+                        f"Could not connect to {peer.get('peer_id', 'peer')}: "
+                        f"{error}"
                     )
 
-                    self.downloaded_pieces[piece_index] = piece_data
+            if not peer_connections:
+                raise ValueError("Could not connect to any peers.")
 
-                    piece_manager.add_piece(piece_index)
+            # Check that all pieces are available somewhere in the swarm.
+            for piece_index in range(self.total_pieces):
+                if not piece_availability[piece_index]:
+                    raise ValueError(
+                        f"No connected peer has piece {piece_index}."
+                    )
 
-                    self.pieces_downloaded += 1
+            piece_manager = PieceManager(self.total_pieces)
 
-                print("\nAll pieces downloaded successfully.")
+            # Count how many peers have each piece.
+            availability_counts = {
+                index: len(piece_availability[index])
+                for index in range(self.total_pieces)
+            }
 
-            # Reconstruct the file in the correct order.
+            print("\nStarting multi-peer download...\n")
+
+            while not piece_manager.is_complete():
+
+                piece_index = piece_manager.select_piece(
+                    self.strategy,
+                    availability_counts
+                )
+
+                # Choose a peer that has the selected piece.
+                selected_peer = None
+
+                for peer_info in peer_connections:
+                    if piece_index in peer_info["pieces"]:
+                        selected_peer = peer_info
+                        break
+
+                if selected_peer is None:
+                    raise ValueError(
+                        f"No peer available for piece {piece_index}."
+                    )
+
+                peer_name = selected_peer["peer"]["peer_id"]
+
+                print(
+                    f"Requesting piece {piece_index} from {peer_name}..."
+                )
+
+                self.download_piece(
+                    selected_peer["connection"],
+                    piece_index
+                )
+
+                piece_manager.add_piece(piece_index)
+
+            print("\nAll pieces downloaded successfully.")
+
+            # Close peer connections before reconstructing the file.
+            for connection in connections:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+
+            connections.clear()
+
+            # Reconstruct the original file in the correct order.
             ordered_pieces = [
                 self.downloaded_pieces[index]
                 for index in range(self.total_pieces)
@@ -236,7 +301,7 @@ class PeerDownloader:
 
             reconstruct_file(ordered_pieces, self.output_path)
 
-            # Verify the reconstructed file size.
+            # Check the reconstructed file size.
             actual_size = os.path.getsize(self.output_path)
             expected_size = self.metainfo["file_size"]
 
@@ -262,7 +327,16 @@ class PeerDownloader:
             ValueError,
             KeyError,
             IndexError,
-            RuntimeError
+            RuntimeError,
+            ConnectionError
         ) as error:
             print(f"\nDownload failed: {error}")
             return False
+
+        finally:
+            # Always close remaining connections.
+            for connection in connections:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
